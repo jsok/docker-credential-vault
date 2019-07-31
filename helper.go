@@ -20,26 +20,44 @@ func NewHelper(kvPath string, client *api.Client) *Helper {
 }
 
 func (h *Helper) Add(creds *credentials.Credentials) error {
-	client := h.client.Logical()
+	data := map[string]interface{}{
+		"ServerURL": creds.ServerURL,
+		"Username":  creds.Username,
+		"Secret":    creds.Secret,
+	}
 	path, err := h.pathForServerURL(creds.ServerURL)
 	if err != nil {
 		return err
 	}
-	_, err = client.Write(path, map[string]interface{}{
-		"ServerURL": creds.ServerURL,
-		"Username":  creds.Username,
-		"Secret":    creds.Secret,
-	})
+
+	mountPath, v2, err := isKVv2(path, h.client)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		path = addPrefixToVKVPath(path, mountPath, "data")
+		data = map[string]interface{}{
+			"data":    data,
+			"options": map[string]interface{}{},
+		}
+	}
+	_, err = h.client.Logical().Write(path, data)
 	return err
 }
 
 func (h *Helper) Delete(serverURL string) error {
-	client := h.client.Logical()
 	path, err := h.pathForServerURL(serverURL)
 	if err != nil {
 		return err
 	}
-	_, err = client.Delete(path)
+	mountPath, v2, err := isKVv2(path, h.client)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		path = addPrefixToVKVPath(path, mountPath, "data")
+	}
+	_, err = h.client.Logical().Delete(path)
 	return err
 }
 
@@ -52,9 +70,16 @@ func (h *Helper) Get(serverURL string) (string, string, error) {
 }
 
 func (h *Helper) List() (map[string]string, error) {
-	client := h.client.Logical()
+	path := h.kvPath
+	mountPath, v2, err := isKVv2(path, h.client)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		path = addPrefixToVKVPath(path, mountPath, "metadata")
+	}
 
-	secret, err := client.List(h.kvPath)
+	secret, err := h.client.Logical().List(path)
 	if err != nil {
 		return nil, err
 	}
@@ -82,18 +107,34 @@ func (h *Helper) List() (map[string]string, error) {
 }
 
 // Internal helper to read a credential from vault
+// which understands both KV v1 and v2 APIs.
 func (h *Helper) read(serverURL string) (*credentials.Credentials, error) {
-	client := h.client.Logical()
 	path, err := h.pathForServerURL(serverURL)
 	if err != nil {
 		return nil, err
 	}
-	secret, err := client.Read(path)
+
+	mountPath, v2, err := isKVv2(path, h.client)
 	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		path = addPrefixToVKVPath(path, mountPath, "data")
+	}
+	secret, err := kvReadRequest(h.client, path, nil)
+	if err != nil || secret == nil {
 		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", path, err)
 	}
 
-	return secretToCredential(secret)
+	data := secret.Data
+	if v2 && data != nil {
+		data = nil
+		dataRaw := secret.Data["data"]
+		if dataRaw != nil {
+			data = dataRaw.(map[string]interface{})
+		}
+	}
+	return secretDataToCredential(data)
 }
 
 func (h *Helper) pathForServerURL(serverURL string) (string, error) {
@@ -106,16 +147,16 @@ func (h *Helper) pathForServerURL(serverURL string) (string, error) {
 }
 
 // Convert a Vault Secret to a Docker Credential
-func secretToCredential(secret *api.Secret) (*credentials.Credentials, error) {
-	server, exists := secret.Data["ServerURL"]
+func secretDataToCredential(data map[string]interface{}) (*credentials.Credentials, error) {
+	server, exists := data["ServerURL"]
 	if !exists {
 		return nil, credentials.NewErrCredentialsMissingServerURL()
 	}
-	username, exists := secret.Data["Username"]
+	username, exists := data["Username"]
 	if !exists {
 		return nil, credentials.NewErrCredentialsMissingUsername()
 	}
-	password, exists := secret.Data["Secret"]
+	password, exists := data["Secret"]
 	if !exists {
 		return nil, fmt.Errorf("no credentials secret")
 	}
@@ -124,20 +165,4 @@ func secretToCredential(secret *api.Secret) (*credentials.Credentials, error) {
 		Username:  username.(string),
 		Secret:    password.(string),
 	}, nil
-}
-
-// extractListData reads the secret and returns a typed list of data and a
-// boolean indicating whether the extraction was successful.
-func extractListData(secret *api.Secret) ([]interface{}, bool) {
-	if secret == nil || secret.Data == nil {
-		return nil, false
-	}
-
-	k, ok := secret.Data["keys"]
-	if !ok || k == nil {
-		return nil, false
-	}
-
-	i, ok := k.([]interface{})
-	return i, ok
 }
